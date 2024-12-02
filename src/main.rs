@@ -5,37 +5,41 @@ use clap::{
     CommandFactory, Parser, Subcommand,
 };
 use console::style;
-use futures::{future, FutureExt, Stream, StreamExt};
+use futures_buffered::BufferedStreamExt;
+use futures_lite::{future::Boxed, StreamExt};
 use indicatif::{
     HumanBytes, HumanDuration, MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle,
 };
-use iroh_bytes::{
+use iroh_base::{node_addr::AddrInfoOptions, ticket::BlobTicket};
+use iroh_blobs::{
     format::collection::Collection,
     get::{
         db::DownloadProgress,
         fsm::{AtBlobHeaderNextError, DecodeError},
         request::get_hash_seq_and_sizes,
     },
-    provider::{self, handle_connection, EventSender},
+    provider::{self, handle_connection, CustomEventSender, EventSender},
     store::{ExportMode, ImportMode, ImportProgress},
+    util::local_pool::LocalPool,
     BlobFormat, Hash, HashAndFormat, TempTag,
 };
-use iroh_mainline_content_discovery::protocol::{
-    AbsoluteTime, Announce, AnnounceKind, Query, QueryFlags, SignedAnnounce,
+use iroh_net::{
+    key::SecretKey,
+    relay::{RelayMap, RelayMode, RelayUrl},
+    Endpoint,
 };
-use iroh_net::{key::SecretKey, MagicEndpoint};
 use rand::Rng;
 use std::{
     collections::BTreeMap,
     fmt::{Display, Formatter},
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{SocketAddrV4, SocketAddrV6},
     path::{Component, Path, PathBuf},
     str::FromStr,
     sync::Arc,
     time::Duration,
 };
-use tokio_util::task::LocalPoolHandle;
 use walkdir::WalkDir;
+
 /// Send a file or directory between two machines, using blake3 verified streaming.
 ///
 /// For all subcommands, you can specify a secret key using the IROH_SECRET
@@ -44,6 +48,7 @@ use walkdir::WalkDir;
 /// You can also specify a port for the magicsocket. If you don't, a random one
 /// will be chosen.
 #[derive(Parser, Debug)]
+#[command(version, about)]
 pub struct Args {
     #[clap(subcommand)]
     pub command: Commands,
@@ -95,19 +100,77 @@ pub enum Commands {
 
 #[derive(Parser, Debug)]
 pub struct CommonArgs {
-    /// The port for the magic socket to listen on.
+    /// The IPv4 address that magicsocket will listen on.
     ///
-    /// Defauls to a random free port, but it can be useful to specify a fixed
+    /// If None, defaults to a random free port, but it can be useful to specify a fixed
     /// port, e.g. to configure a firewall rule.
-    #[clap(long, default_value_t = 0)]
-    pub magic_port: u16,
+    #[clap(long, default_value = None)]
+    pub magic_ipv4_addr: Option<SocketAddrV4>,
+
+    /// The IPv6 address that magicsocket will listen on.
+    ///
+    /// If None, defaults to a random free port, but it can be useful to specify a fixed
+    /// port, e.g. to configure a firewall rule.
+    #[clap(long, default_value = None)]
+    pub magic_ipv6_addr: Option<SocketAddrV6>,
 
     #[clap(long, default_value_t = Format::Hex)]
     pub format: Format,
 
     #[clap(short = 'v', long, action = clap::ArgAction::Count)]
     pub verbose: u8,
+
+    /// The relay URL to use as a home relay,
+    ///
+    /// Can be set to "disable" to disable relay servers and "default"
+    /// to configure default servers.
+    #[clap(long, default_value_t = RelayModeOption::Default)]
+    pub relay: RelayModeOption,
 }
+
+/// Available command line options for configuring relays.
+#[derive(Clone, Debug)]
+pub enum RelayModeOption {
+    /// Disables relays altogether.
+    Disabled,
+    /// Uses the default relay servers.
+    Default,
+    /// Uses a single, custom relay server by URL.
+    Custom(RelayUrl),
+}
+
+impl FromStr for RelayModeOption {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "disabled" => Ok(Self::Disabled),
+            "default" => Ok(Self::Default),
+            _ => Ok(Self::Custom(RelayUrl::from_str(s)?)),
+        }
+    }
+}
+
+impl Display for RelayModeOption {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disabled => f.write_str("disabled"),
+            Self::Default => f.write_str("default"),
+            Self::Custom(url) => url.fmt(f),
+        }
+    }
+}
+
+impl From<RelayModeOption> for RelayMode {
+    fn from(value: RelayModeOption) -> Self {
+        match value {
+            RelayModeOption::Disabled => RelayMode::Disabled,
+            RelayModeOption::Default => RelayMode::Default,
+            RelayModeOption::Custom(url) => RelayMode::Custom(RelayMap::from_url(url)),
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 pub struct SendArgs {
     /// Path to the file or directory to send.
@@ -116,9 +179,21 @@ pub struct SendArgs {
     /// being shared.
     pub path: PathBuf,
 
-    /// Trackers to announce the data to.
-    #[clap(long)]
-    pub tracker: Vec<SocketAddr>,
+    /// What type of ticket to use.
+    ///
+    /// Use "id" for the shortest type only including the node ID,
+    /// "addresses" to only add IP addresses without a relay url,
+    /// "relay" to only add a relay address, and leave the option out
+    /// to use the biggest type of ticket that includes both relay and
+    /// address information.
+    ///
+    /// Generally, the more information the higher the likelyhood of
+    /// a successful connection, but also the bigger a ticket to connect.
+    ///
+    /// This is most useful for debugging which methods of connection
+    /// establishment work well.
+    #[clap(long, default_value_t = AddrInfoOptions::RelayAndAddresses)]
+    pub ticket_type: AddrInfoOptions,
 
     #[clap(flatten)]
     pub common: CommonArgs,
@@ -127,7 +202,7 @@ pub struct SendArgs {
 #[derive(Parser, Debug)]
 pub struct ReceiveArgs {
     /// The ticket to use to connect to the sender.
-    pub content: HashAndFormat,
+    pub ticket: BlobTicket,
 
     #[clap(flatten)]
     pub common: CommonArgs,
@@ -203,7 +278,7 @@ pub fn canonicalized_path_to_string(
 }
 
 pub async fn show_ingest_progress(
-    mut stream: impl Stream<Item = ImportProgress> + Unpin,
+    recv: async_channel::Receiver<ImportProgress>,
 ) -> anyhow::Result<()> {
     let mp = MultiProgress::new();
     mp.set_draw_target(ProgressDrawTarget::stderr());
@@ -216,12 +291,13 @@ pub async fn show_ingest_progress(
     let mut names = BTreeMap::new();
     let mut sizes = BTreeMap::new();
     let mut pbs = BTreeMap::new();
-    while let Some(event) = stream.next().await {
+    loop {
+        let event = recv.recv().await;
         match event {
-            ImportProgress::Found { id, name } => {
+            Ok(ImportProgress::Found { id, name }) => {
                 names.insert(id, name);
             }
-            ImportProgress::Size { id, size } => {
+            Ok(ImportProgress::Size { id, size }) => {
                 sizes.insert(id, size);
                 let total_size = sizes.values().sum::<u64>();
                 op.set_message(format!(
@@ -239,19 +315,23 @@ pub async fn show_ingest_progress(
                 pb.set_length(size);
                 pbs.insert(id, pb);
             }
-            ImportProgress::OutboardProgress { id, offset } => {
+            Ok(ImportProgress::OutboardProgress { id, offset }) => {
                 if let Some(pb) = pbs.get(&id) {
                     pb.set_position(offset);
                 }
             }
-            ImportProgress::OutboardDone { id, .. } => {
+            Ok(ImportProgress::OutboardDone { id, .. }) => {
                 // you are not guaranteed to get any OutboardProgress
                 if let Some(pb) = pbs.remove(&id) {
                     pb.finish_and_clear();
                 }
             }
-            ImportProgress::CopyProgress { .. } => {
+            Ok(ImportProgress::CopyProgress { .. }) => {
                 // we are not copying anything
+            }
+            Err(e) => {
+                op.set_message(format!("Error receiving progress: {e}"));
+                break;
             }
         }
     }
@@ -268,7 +348,7 @@ pub async fn show_ingest_progress(
 /// directory.
 async fn import(
     path: PathBuf,
-    db: impl iroh_bytes::store::Store,
+    db: impl iroh_blobs::store::Store,
 ) -> anyhow::Result<(TempTag, u64, Collection)> {
     let path = path.canonicalize()?;
     anyhow::ensure!(path.exists(), "path {} does not exist", path.display());
@@ -291,11 +371,11 @@ async fn import(
         })
         .filter_map(Result::transpose)
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let (send, recv) = flume::bounded(32);
-    let progress = iroh_bytes::util::progress::FlumeProgressSender::new(send);
-    let show_progress = tokio::spawn(show_ingest_progress(recv.into_stream()));
+    let (send, recv) = async_channel::bounded(32);
+    let progress = iroh_blobs::util::progress::AsyncChannelProgressSender::new(send);
+    let show_progress = tokio::spawn(show_ingest_progress(recv));
     // import all the files, using num_cpus workers, return names and temp tags
-    let mut names_and_tags = futures::stream::iter(data_sources)
+    let mut names_and_tags = futures_lite::stream::iter(data_sources)
         .map(|(name, path)| {
             let db = db.clone();
             let progress = progress.clone();
@@ -306,7 +386,7 @@ async fn import(
                 anyhow::Ok((name, temp_tag, file_size))
             }
         })
-        .buffer_unordered(num_cpus::get())
+        .buffered_unordered(num_cpus::get())
         .collect::<Vec<_>>()
         .await
         .into_iter()
@@ -339,7 +419,7 @@ fn get_export_path(root: &Path, name: &str) -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
-async fn export(db: impl iroh_bytes::store::Store, collection: Collection) -> anyhow::Result<()> {
+async fn export(db: impl iroh_blobs::store::Store, collection: Collection) -> anyhow::Result<()> {
     let root = std::env::current_dir()?;
     for (name, hash) in collection.iter() {
         let target = get_export_path(&root, name)?;
@@ -403,8 +483,13 @@ impl Drop for ClientStatus {
     }
 }
 
-impl EventSender for ClientStatus {
-    fn send(&self, event: iroh_bytes::provider::Event) -> futures::prelude::future::BoxFuture<()> {
+impl CustomEventSender for ClientStatus {
+    fn send(&self, event: iroh_blobs::provider::Event) -> Boxed<()> {
+        self.try_send(event);
+        Box::pin(std::future::ready(()))
+    }
+
+    fn try_send(&self, event: provider::Event) {
         tracing::info!("{:?}", event);
         let msg = match event {
             provider::Event::ClientConnected { connection_id } => {
@@ -441,25 +526,27 @@ impl EventSender for ClientStatus {
         if let Some(msg) = msg {
             self.current.set_message(msg);
         }
-        future::ready(()).boxed()
     }
 }
 
 async fn send(args: SendArgs) -> anyhow::Result<()> {
     let secret_key = get_or_create_secret(args.common.verbose > 0)?;
-    let discovery = iroh_pkarr_node_discovery::PkarrNodeDiscovery::builder()
-        .secret_key(&secret_key)
-        .build();
     // create a magicsocket endpoint
-    let endpoint_fut = MagicEndpoint::builder()
-        .alpns(vec![iroh_bytes::protocol::ALPN.to_vec()])
-        .secret_key(secret_key.clone())
-        .discovery(Box::new(discovery))
-        .bind(args.common.magic_port);
+    let mut builder = Endpoint::builder()
+        .alpns(vec![iroh_blobs::protocol::ALPN.to_vec()])
+        .secret_key(secret_key)
+        .relay_mode(args.common.relay.into());
+    if let Some(addr) = args.common.magic_ipv4_addr {
+        builder = builder.bind_addr_v4(addr);
+    }
+    if let Some(addr) = args.common.magic_ipv6_addr {
+        builder = builder.bind_addr_v6(addr);
+    }
+    let endpoint_fut = builder.bind();
     // use a flat store - todo: use a partial in mem store instead
     let suffix = rand::thread_rng().gen::<[u8; 16]>();
     let iroh_data_dir =
-        std::env::current_dir()?.join(format!(".swarmie-send-{}", hex::encode(suffix)));
+        std::env::current_dir()?.join(format!(".sendme-send-{}", hex::encode(suffix)));
     if iroh_data_dir.exists() {
         println!("can not share twice from the same directory");
         std::process::exit(1);
@@ -473,35 +560,20 @@ async fn send(args: SendArgs) -> anyhow::Result<()> {
         anyhow::Ok(())
     });
     std::fs::create_dir_all(&iroh_data_dir)?;
-    let db = iroh_bytes::store::fs::Store::load(&iroh_data_dir).await?;
+    let db = iroh_blobs::store::fs::Store::load(&iroh_data_dir).await?;
     let path = args.path;
     let (temp_tag, size, collection) = import(path.clone(), db.clone()).await?;
     let hash = *temp_tag.hash();
     // wait for the endpoint to be ready
     let endpoint = endpoint_fut.await?;
     // wait for the endpoint to figure out its address before making a ticket
-    while endpoint.my_relay().is_none() {
+    while endpoint.home_relay().is_none() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     // make a ticket
-    let addr = endpoint.my_addr().await?;
-    let content = *temp_tag.inner();
-    let announce = Announce {
-        host: addr.node_id,
-        content,
-        kind: AnnounceKind::Complete,
-        timestamp: AbsoluteTime::now(),
-    };
-    let signed_announce = SignedAnnounce::new(announce, &secret_key)?;
-    let udp_discovery = iroh_mainline_content_discovery::UdpDiscovery::new(SocketAddr::V4(
-        SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
-    ))
-    .await?;
-    for tracker in args.tracker {
-        println!("announcing content {} to tracker {}", content, tracker);
-        udp_discovery.add_tracker(tracker).await?;
-    }
-    udp_discovery.announce(signed_announce).await?;
+    let mut addr = endpoint.node_addr().await?;
+    addr.apply_options(args.ticket_type);
+    let ticket = BlobTicket::new(addr, hash, BlobFormat::HashSeq)?;
     let entry_type = if path.is_file() { "file" } else { "directory" };
     println!(
         "imported {} {}, {}, hash {}",
@@ -516,18 +588,25 @@ async fn send(args: SendArgs) -> anyhow::Result<()> {
         }
     }
     println!("to get this data, use");
-    println!("swarmie receive {}", content);
+    println!("sendme receive {}", ticket);
     let ps = SendStatus::new();
-    let rt = LocalPoolHandle::new(1);
+    let lp = LocalPool::single();
+    let send_client = Arc::new(ps.new_client());
     loop {
         let Some(connecting) = endpoint.accept().await else {
             tracing::info!("no more incoming connections, exiting");
             break;
         };
         let db = db.clone();
-        let rt = rt.clone();
-        let ps = ps.clone();
-        tokio::spawn(handle_connection(connecting, db, ps.new_client(), rt));
+        let lph = lp.handle().clone();
+        let sc = send_client.clone();
+        let connection = connecting.await?;
+        tokio::spawn(handle_connection(
+            connection,
+            db,
+            EventSender::new(Some(sc)),
+            lph,
+        ));
     }
     drop(temp_tag);
     std::fs::remove_dir_all(iroh_data_dir)?;
@@ -548,7 +627,7 @@ fn make_download_progress() -> ProgressBar {
 }
 
 pub async fn show_download_progress(
-    mut stream: impl Stream<Item = DownloadProgress> + Unpin,
+    recv: async_channel::Receiver<DownloadProgress>,
     total_size: u64,
 ) -> anyhow::Result<()> {
     let mp = MultiProgress::new();
@@ -557,12 +636,13 @@ pub async fn show_download_progress(
     op.set_message(format!("{} Connecting ...\n", style("[1/3]").bold().dim()));
     let mut total_done = 0;
     let mut sizes = BTreeMap::new();
-    while let Some(x) = stream.next().await {
+    loop {
+        let x = recv.recv().await;
         match x {
-            DownloadProgress::Connected => {
+            Ok(DownloadProgress::Connected) => {
                 op.set_message(format!("{} Requesting ...\n", style("[2/3]").bold().dim()));
             }
-            DownloadProgress::FoundHashSeq { children, .. } => {
+            Ok(DownloadProgress::FoundHashSeq { children, .. }) => {
                 op.set_message(format!(
                     "{} Downloading {} blob(s)\n",
                     style("[3/3]").bold().dim(),
@@ -571,16 +651,16 @@ pub async fn show_download_progress(
                 op.set_length(total_size);
                 op.reset();
             }
-            DownloadProgress::Found { id, size, .. } => {
+            Ok(DownloadProgress::Found { id, size, .. }) => {
                 sizes.insert(id, size);
             }
-            DownloadProgress::Progress { offset, .. } => {
+            Ok(DownloadProgress::Progress { offset, .. }) => {
                 op.set_position(total_done + offset);
             }
-            DownloadProgress::Done { id } => {
+            Ok(DownloadProgress::Done { id }) => {
                 total_done += sizes.remove(&id).unwrap_or_default();
             }
-            DownloadProgress::AllDone(stats) => {
+            Ok(DownloadProgress::AllDone(stats)) => {
                 op.finish_and_clear();
                 eprintln!(
                     "Transferred {} in {}, {}/s",
@@ -590,8 +670,11 @@ pub async fn show_download_progress(
                 );
                 break;
             }
-            DownloadProgress::Abort(e) => {
-                anyhow::bail!("download aborted: {:?}", e);
+            Ok(DownloadProgress::Abort(e)) => {
+                anyhow::bail!("download aborted: {e:?}");
+            }
+            Err(e) => {
+                anyhow::bail!("error reading progress: {e:?}");
             }
             _ => {}
         }
@@ -645,74 +728,48 @@ fn show_get_error(e: anyhow::Error) -> anyhow::Error {
     e
 }
 
-async fn get(args: ReceiveArgs) -> anyhow::Result<()> {
-    let dht = mainline::Dht::default();
-    let content = args.content;
+async fn receive(args: ReceiveArgs) -> anyhow::Result<()> {
+    let ticket = args.ticket;
+    let addr = ticket.node_addr().clone();
     let secret_key = get_or_create_secret(args.common.verbose > 0)?;
-    let discovery = iroh_pkarr_node_discovery::PkarrNodeDiscovery::default();
-    let endpoint = MagicEndpoint::builder()
+    let mut builder = Endpoint::builder()
         .alpns(vec![])
         .secret_key(secret_key)
-        .discovery(Box::new(discovery))
-        .bind(args.common.magic_port)
-        .await?;
-    let udp_discovery = iroh_mainline_content_discovery::UdpDiscovery::new(SocketAddr::V4(
-        SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
-    ))
-    .await?;
-    let query = Query {
-        content,
-        flags: QueryFlags {
-            complete: true,
-            verified: true,
-        },
-    };
-    tracing::info!("query {:?}", query);
-    let stream = udp_discovery.query_dht(dht, query).await?;
-    let connections = stream
-        .map(move |announce| {
-            tracing::info!("got announce {:?}", announce);
-            let endpoint = endpoint.clone();
-            async move {
-                endpoint
-                    .connect_by_node_id(&announce.host, iroh_bytes::protocol::ALPN)
-                    .await
-            }
-        })
-        .buffer_unordered(4)
-        .filter_map(|x| async {
-            match x {
-                Ok(x) => Some(x),
-                Err(e) => {
-                    eprintln!("error connecting to node: {:?}", e);
-                    None
-                }
-            }
-        });
-    tokio::pin!(connections);
-    let Some(connection) = connections.next().await else {
-        eprintln!("no announce found");
-        std::process::exit(1);
-    };
-    let dir_name = format!(".swarmie-get-{}", content.hash.to_hex());
+        .relay_mode(args.common.relay.into());
+
+    if let Some(addr) = args.common.magic_ipv4_addr {
+        builder = builder.bind_addr_v4(addr);
+    }
+    if let Some(addr) = args.common.magic_ipv6_addr {
+        builder = builder.bind_addr_v6(addr);
+    }
+    let endpoint = builder.bind().await?;
+    let dir_name = format!(".sendme-get-{}", ticket.hash().to_hex());
     let iroh_data_dir = std::env::current_dir()?.join(dir_name);
-    let db = iroh_bytes::store::fs::Store::load(&iroh_data_dir).await?;
+    let db = iroh_blobs::store::fs::Store::load(&iroh_data_dir).await?;
     let mp = MultiProgress::new();
     let connect_progress = mp.add(ProgressBar::hidden());
     connect_progress.set_draw_target(ProgressDrawTarget::stderr());
     connect_progress.set_style(ProgressStyle::default_spinner());
+    connect_progress.set_message(format!("connecting to {}", addr.node_id));
+    let connection = endpoint.connect(addr, iroh_blobs::protocol::ALPN).await?;
+    let hash_and_format = HashAndFormat {
+        hash: ticket.hash(),
+        format: ticket.format(),
+    };
     connect_progress.finish_and_clear();
-    let (send, recv) = flume::bounded(32);
-    let progress = iroh_bytes::util::progress::FlumeProgressSender::new(send);
-    let (_hash_seq, sizes) = get_hash_seq_and_sizes(&connection, &content.hash, 1024 * 1024 * 32)
-        .await
-        .map_err(show_get_error)?;
+    let (send, recv) = async_channel::bounded(32);
+    let progress = iroh_blobs::util::progress::AsyncChannelProgressSender::new(send);
+    let (_hash_seq, sizes) =
+        get_hash_seq_and_sizes(&connection, &hash_and_format.hash, 1024 * 1024 * 32)
+            .await
+            .map_err(show_get_error)?;
     let total_size = sizes.iter().sum::<u64>();
     let total_files = sizes.len().saturating_sub(1);
     let payload_size = sizes.iter().skip(1).sum::<u64>();
     eprintln!(
         "getting collection {} {} files, {}",
-        print_hash(&content.hash, args.common.format),
+        print_hash(&ticket.hash(), args.common.format),
         total_files,
         HumanBytes(payload_size)
     );
@@ -724,12 +781,12 @@ async fn get(args: ReceiveArgs) -> anyhow::Result<()> {
             HumanBytes(total_size)
         );
     }
-    let _task = tokio::spawn(show_download_progress(recv.into_stream(), total_size));
+    let _task = tokio::spawn(show_download_progress(recv, total_size));
     let get_conn = || async move { Ok(connection) };
-    let stats = iroh_bytes::get::db::get_to_db(&db, get_conn, &content, progress)
+    let stats = iroh_blobs::get::db::get_to_db(&db, get_conn, &hash_and_format, progress)
         .await
         .map_err(|e| show_get_error(anyhow::anyhow!(e)))?;
-    let collection = Collection::load(&db, &content.hash).await?;
+    let collection = Collection::load_db(&db, &hash_and_format.hash).await?;
     if args.common.verbose > 0 {
         for (name, hash) in collection.iter() {
             println!("    {} {name}", print_hash(hash, args.common.format));
@@ -774,7 +831,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let res = match args.command {
         Commands::Send(args) => send(args).await,
-        Commands::Receive(args) => get(args).await,
+        Commands::Receive(args) => receive(args).await,
     };
     match res {
         Ok(()) => std::process::exit(0),
