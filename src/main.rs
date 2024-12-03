@@ -23,6 +23,9 @@ use iroh_blobs::{
     util::local_pool::LocalPool,
     BlobFormat, Hash, HashAndFormat, TempTag,
 };
+use iroh_mainline_content_discovery::protocol::{
+    AbsoluteTime, Announce, AnnounceKind, Query, QueryFlags, SignedAnnounce,
+};
 use iroh_net::{
     key::SecretKey,
     relay::{RelayMap, RelayMode, RelayUrl},
@@ -32,7 +35,7 @@ use rand::Rng;
 use std::{
     collections::BTreeMap,
     fmt::{Display, Formatter},
-    net::{SocketAddrV4, SocketAddrV6},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     path::{Component, Path, PathBuf},
     str::FromStr,
     sync::Arc,
@@ -179,6 +182,10 @@ pub struct SendArgs {
     /// being shared.
     pub path: PathBuf,
 
+    /// Trackers to announce the data to.
+    #[clap(long)]
+    pub tracker: Vec<SocketAddr>,
+
     /// What type of ticket to use.
     ///
     /// Use "id" for the shortest type only including the node ID,
@@ -202,7 +209,7 @@ pub struct SendArgs {
 #[derive(Parser, Debug)]
 pub struct ReceiveArgs {
     /// The ticket to use to connect to the sender.
-    pub ticket: BlobTicket,
+    pub content: HashAndFormat,
 
     #[clap(flatten)]
     pub common: CommonArgs,
@@ -531,6 +538,9 @@ impl CustomEventSender for ClientStatus {
 
 async fn send(args: SendArgs) -> anyhow::Result<()> {
     let secret_key = get_or_create_secret(args.common.verbose > 0)?;
+    let discovery = iroh_pkarr_node_discovery::PkarrNodeDiscovery::builder()
+    .secret_key(&secret_key)
+    .build();
     // create a magicsocket endpoint
     let mut builder = Endpoint::builder()
         .alpns(vec![iroh_blobs::protocol::ALPN.to_vec()])
@@ -571,9 +581,24 @@ async fn send(args: SendArgs) -> anyhow::Result<()> {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     // make a ticket
-    let mut addr = endpoint.node_addr().await?;
-    addr.apply_options(args.ticket_type);
-    let ticket = BlobTicket::new(addr, hash, BlobFormat::HashSeq)?;
+    let addr = endpoint.node_addr().await?;
+    let content = *temp_tag.inner();
+    let announce = Announce {
+        host: addr.node_id,
+        content, 
+        kind: AnnounceKind::Complete,
+        timestamp: AbsoluteTime::now(),
+    };
+    let signed_announce = SignedAnnounce::new(announce, &secret_key)?;
+    let udp_discovery = iroh_mainline_content_discovery::UdpDiscovery::new(SocketAddr::V4(
+        SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
+    ))
+    .await?;
+    for tracker in args.tracker {
+        println!("announcing content {} to tracker {}", content, tracker);
+        udp_discovery.add_tracker(tracker).await?;
+    }
+    udp_discovery.announce(signed_announce).await?;
     let entry_type = if path.is_file() { "file" } else { "directory" };
     println!(
         "imported {} {}, {}, hash {}",
