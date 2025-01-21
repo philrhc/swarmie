@@ -10,7 +10,6 @@ use futures_lite::{future::Boxed, StreamExt};
 use indicatif::{
     HumanBytes, HumanDuration, MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle,
 };
-use iroh_base::{node_addr::AddrInfoOptions, ticket::BlobTicket};
 use iroh_blobs::{
     format::collection::Collection,
     get::{
@@ -26,12 +25,11 @@ use iroh_blobs::{
 use iroh_mainline_content_discovery::protocol::{
     AbsoluteTime, Announce, AnnounceKind, Query, QueryFlags, SignedAnnounce,
 };
-use iroh_net::{
-    key::SecretKey,
-    relay::{RelayMap, RelayMode, RelayUrl},
-    Endpoint,
+use iroh::{
+    discovery::dns::DnsDiscovery, Endpoint, RelayMap, RelayMode, RelayUrl, SecretKey
 };
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fmt::{Display, Formatter},
@@ -142,6 +140,33 @@ pub enum RelayModeOption {
     Custom(RelayUrl),
 }
 
+/// Options to configure what is included in a [`NodeAddr`]
+#[derive(
+    Copy,
+    Clone,
+    PartialEq,
+    Eq,
+    Default,
+    Debug,
+    derive_more::Display,
+    derive_more::FromStr,
+    Serialize,
+    Deserialize,
+)]
+pub enum AddrInfoOptions {
+    /// Only the Node ID is added.
+    ///
+    /// This usually means that iroh-dns discovery is used to find address information.
+    #[default]
+    Id,
+    /// Includes the Node ID and both the relay URL, and the direct addresses.
+    RelayAndAddresses,
+    /// Includes the Node ID and the relay URL.
+    Relay,
+    /// Includes the Node ID and the direct addresses.
+    Addresses,
+}
+
 impl FromStr for RelayModeOption {
     type Err = anyhow::Error;
 
@@ -222,7 +247,7 @@ fn get_or_create_secret(print: bool) -> anyhow::Result<SecretKey> {
     match std::env::var("IROH_SECRET") {
         Ok(secret) => SecretKey::from_str(&secret).context("invalid secret"),
         Err(_) => {
-            let key = SecretKey::generate();
+            let key = SecretKey::generate(rand::rngs::OsRng);
             if print {
                 eprintln!("using secret key {}", key);
             }
@@ -497,7 +522,7 @@ impl CustomEventSender for ClientStatus {
     }
 
     fn try_send(&self, event: provider::Event) {
-        tracing::info!("{:?}", event);
+        println!("{:?}", event);
         let msg = match event {
             provider::Event::ClientConnected { connection_id } => {
                 Some(format!("{} got connection", connection_id))
@@ -538,21 +563,18 @@ impl CustomEventSender for ClientStatus {
 
 async fn send(args: SendArgs) -> anyhow::Result<()> {
     let secret_key = get_or_create_secret(args.common.verbose > 0)?;
-    let discovery = iroh_pkarr_node_discovery::PkarrNodeDiscovery::builder()
-    .secret_key(&secret_key)
-    .build();
     // create a magicsocket endpoint
     let mut builder = Endpoint::builder()
         .alpns(vec![iroh_blobs::protocol::ALPN.to_vec()])
-        .secret_key(secret_key)
-        .relay_mode(args.common.relay.into());
+        .secret_key(secret_key.clone())
+        .relay_mode(args.common.relay.into())
+        .add_discovery(|_| Some(DnsDiscovery::n0_dns()));
     if let Some(addr) = args.common.magic_ipv4_addr {
         builder = builder.bind_addr_v4(addr);
     }
     if let Some(addr) = args.common.magic_ipv6_addr {
         builder = builder.bind_addr_v6(addr);
     }
-    let endpoint_fut = builder.bind();
     // use a flat store - todo: use a partial in mem store instead
     let suffix = rand::thread_rng().gen::<[u8; 16]>();
     let iroh_data_dir =
@@ -575,12 +597,7 @@ async fn send(args: SendArgs) -> anyhow::Result<()> {
     let (temp_tag, size, collection) = import(path.clone(), db.clone()).await?;
     let hash = *temp_tag.hash();
     // wait for the endpoint to be ready
-    let endpoint = endpoint_fut.await?;
-    // wait for the endpoint to figure out its address before making a ticket
-    while endpoint.home_relay().is_none() {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    // make a ticket
+    let endpoint = builder.bind().await?;
     let addr = endpoint.node_addr().await?;
     let content = *temp_tag.inner();
     let announce = Announce {
@@ -613,15 +630,16 @@ async fn send(args: SendArgs) -> anyhow::Result<()> {
         }
     }
     println!("to get this data, use");
-    println!("sendme receive {}", ticket);
+    println!("swarmie receive {}", content);
     let ps = SendStatus::new();
     let lp = LocalPool::single();
     let send_client = Arc::new(ps.new_client());
     loop {
         let Some(connecting) = endpoint.accept().await else {
-            tracing::info!("no more incoming connections, exiting");
+            println!("no more incoming connections, exiting");
             break;
         };
+        println!("incoming connection");
         let db = db.clone();
         let lph = lp.handle().clone();
         let sc = send_client.clone();
@@ -754,14 +772,14 @@ fn show_get_error(e: anyhow::Error) -> anyhow::Error {
 }
 
 async fn receive(args: ReceiveArgs) -> anyhow::Result<()> {
-    let ticket = args.ticket;
-    let addr = ticket.node_addr().clone();
+    let dht = mainline::Dht::builder().build();
+    let content = args.content;
     let secret_key = get_or_create_secret(args.common.verbose > 0)?;
     let mut builder = Endpoint::builder()
         .alpns(vec![])
-        .secret_key(secret_key)
-        .relay_mode(args.common.relay.into());
-
+        .secret_key(secret_key.clone())
+        .relay_mode(args.common.relay.into())
+        .add_discovery(|_| Some(DnsDiscovery::n0_dns()));
     if let Some(addr) = args.common.magic_ipv4_addr {
         builder = builder.bind_addr_v4(addr);
     }
@@ -769,24 +787,54 @@ async fn receive(args: ReceiveArgs) -> anyhow::Result<()> {
         builder = builder.bind_addr_v6(addr);
     }
     let endpoint = builder.bind().await?;
-    let dir_name = format!(".sendme-get-{}", ticket.hash().to_hex());
+    let udp_discovery = iroh_mainline_content_discovery::UdpDiscovery::new(SocketAddr::V4(
+        SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
+    ))
+    .await?;
+    let query = Query {
+        content,
+        flags: QueryFlags {
+            complete: true,
+            verified: true,
+        },
+    };
+    println!("query {:?}", query);
+    let stream = udp_discovery.query_dht(dht?, query).await?;
+    let connections = stream
+        .map(move |announce| {
+            println!("got announce {:?}", announce);
+            let endpoint = endpoint.clone();
+            async move {
+                endpoint.connect(announce.host, iroh_blobs::protocol::ALPN).await
+            }
+        })
+        .buffered_unordered(4)
+        .filter_map(|x| 
+            match x {
+                Ok(x) => Some(x),
+                Err(e) => {
+                    eprintln!("error connecting to node: {:?}", e);
+                    None
+                }
+            }
+        );
+    tokio::pin!(connections);
+    let Some(connection) = connections.next().await else {
+        eprintln!("no announce found");
+        std::process::exit(1);
+    };
+    let dir_name = format!(".swarmie-get-{}", content.hash.to_hex());
     let iroh_data_dir = std::env::current_dir()?.join(dir_name);
     let db = iroh_blobs::store::fs::Store::load(&iroh_data_dir).await?;
     let mp = MultiProgress::new();
     let connect_progress = mp.add(ProgressBar::hidden());
     connect_progress.set_draw_target(ProgressDrawTarget::stderr());
     connect_progress.set_style(ProgressStyle::default_spinner());
-    connect_progress.set_message(format!("connecting to {}", addr.node_id));
-    let connection = endpoint.connect(addr, iroh_blobs::protocol::ALPN).await?;
-    let hash_and_format = HashAndFormat {
-        hash: ticket.hash(),
-        format: ticket.format(),
-    };
     connect_progress.finish_and_clear();
     let (send, recv) = async_channel::bounded(32);
     let progress = iroh_blobs::util::progress::AsyncChannelProgressSender::new(send);
     let (_hash_seq, sizes) =
-        get_hash_seq_and_sizes(&connection, &hash_and_format.hash, 1024 * 1024 * 32)
+        get_hash_seq_and_sizes(&connection, &content.hash, 1024 * 1024 * 32)
             .await
             .map_err(show_get_error)?;
     let total_size = sizes.iter().sum::<u64>();
@@ -794,7 +842,7 @@ async fn receive(args: ReceiveArgs) -> anyhow::Result<()> {
     let payload_size = sizes.iter().skip(1).sum::<u64>();
     eprintln!(
         "getting collection {} {} files, {}",
-        print_hash(&ticket.hash(), args.common.format),
+        print_hash(&content.hash, args.common.format),
         total_files,
         HumanBytes(payload_size)
     );
@@ -808,10 +856,10 @@ async fn receive(args: ReceiveArgs) -> anyhow::Result<()> {
     }
     let _task = tokio::spawn(show_download_progress(recv, total_size));
     let get_conn = || async move { Ok(connection) };
-    let stats = iroh_blobs::get::db::get_to_db(&db, get_conn, &hash_and_format, progress)
+    let stats = iroh_blobs::get::db::get_to_db(&db, get_conn, &content, progress)
         .await
         .map_err(|e| show_get_error(anyhow::anyhow!(e)))?;
-    let collection = Collection::load_db(&db, &hash_and_format.hash).await?;
+    let collection = Collection::load_db(&db, &content.hash).await?;
     if args.common.verbose > 0 {
         for (name, hash) in collection.iter() {
             println!("    {} {name}", print_hash(hash, args.common.format));
