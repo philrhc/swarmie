@@ -26,7 +26,8 @@ use iroh_mainline_content_discovery::protocol::{
     AbsoluteTime, Announce, AnnounceKind, Query, QueryFlags, SignedAnnounce,
 };
 use iroh::{
-    discovery::dns::DnsDiscovery, Endpoint, RelayMap, RelayMode, RelayUrl, SecretKey
+    discovery::{dns::DnsDiscovery, local_swarm_discovery::LocalSwarmDiscovery, ConcurrentDiscovery}, 
+    Endpoint, RelayMap, RelayMode, RelayUrl, SecretKey
 };
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -563,11 +564,17 @@ impl CustomEventSender for ClientStatus {
 
 async fn send(args: SendArgs) -> anyhow::Result<()> {
     let secret_key = get_or_create_secret(args.common.verbose > 0)?;
+    let discovery = ConcurrentDiscovery::from_services(vec![
+        Box::new(DnsDiscovery::n0_dns()),
+        Box::new(LocalSwarmDiscovery::new(secret_key.public())?),
+        //Box::new(DhtDiscovery::new(secret_key.public())?),
+    ]);
     // create a magicsocket endpoint
     let mut builder = Endpoint::builder()
         .alpns(vec![iroh_blobs::protocol::ALPN.to_vec()])
         .secret_key(secret_key.clone())
         .relay_mode(args.common.relay.into())
+        .discovery(Box::new(discovery))
         .add_discovery(|_| Some(DnsDiscovery::n0_dns()));
     if let Some(addr) = args.common.magic_ipv4_addr {
         builder = builder.bind_addr_v4(addr);
@@ -775,11 +782,16 @@ async fn receive(args: ReceiveArgs) -> anyhow::Result<()> {
     let dht = mainline::Dht::builder().build();
     let content = args.content;
     let secret_key = get_or_create_secret(args.common.verbose > 0)?;
+    let discovery = ConcurrentDiscovery::from_services(vec![
+        Box::new(DnsDiscovery::n0_dns()),
+        Box::new(LocalSwarmDiscovery::new(secret_key.public())?),
+        //Box::new(DhtDiscovery::new(secret_key.public())?),
+    ]);
     let mut builder = Endpoint::builder()
         .alpns(vec![])
         .secret_key(secret_key.clone())
         .relay_mode(args.common.relay.into())
-        .add_discovery(|_| Some(DnsDiscovery::n0_dns()));
+        .discovery(Box::new(discovery));
     if let Some(addr) = args.common.magic_ipv4_addr {
         builder = builder.bind_addr_v4(addr);
     }

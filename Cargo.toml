@@ -25,10 +25,10 @@ futures-buffered = "0.2.4"
 futures-lite = "2.3.0"
 hex = "0.4.3"
 indicatif = "0.17.7"
-iroh-blobs = "0.30"
+iroh-blobs = "0.31"
 iroh-io = "0.6"
 iroh-mainline-content-discovery = { path = "../iroh-experiments/content-discovery/iroh-mainline-content-discovery" }
-iroh = "0.30"
+iroh = { version = "0.31", features = ["discovery-pkarr-dht", "discovery-local-network"] }
 mainline = { version = "2.0.0", features = ["async"] }
 num_cpus = "1.16.0"
 pkarr = "=1.1.3"
