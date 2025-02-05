@@ -585,7 +585,7 @@ async fn send(args: SendArgs) -> anyhow::Result<()> {
     // use a flat store - todo: use a partial in mem store instead
     let suffix = rand::thread_rng().gen::<[u8; 16]>();
     let iroh_data_dir =
-        std::env::current_dir()?.join(format!(".sendme-send-{}", hex::encode(suffix)));
+        std::env::current_dir()?.join(format!(".swarmie-send-{}", hex::encode(suffix)));
     if iroh_data_dir.exists() {
         println!("can not share twice from the same directory");
         std::process::exit(1);

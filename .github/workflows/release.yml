@@ -22,7 +22,7 @@ on:
   workflow_dispatch:
 
 env:
-  BIN_NAME: sendme
+  BIN_NAME: swarmie
 jobs:
   create-release:
     name: create-release
